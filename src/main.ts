@@ -1,99 +1,327 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import {
+	Debouncer,
+	MarkdownView,
+	Notice,
+	Plugin,
+	TAbstractFile,
+	WorkspaceLeaf,
+	debounce,
+} from "obsidian";
+import { type FileContents, parsePatchFiles } from "@pierre/diffs";
+import { DEFAULT_SETTINGS, GitDiffsSettings, GitDiffsSettingTab } from "./settings";
+import { DiffViewState, GIT_DIFFS_VIEW_TYPE, GitDiffsView } from "./view";
+import { FileRenderSpec } from "./render";
+import { getGitDiff, isGitRepo, readGitBlob } from "./git";
 
-// Remember to rename these classes and interfaces!
+export const GIT_DIFFS_REFRESH_EVENT = "git-diffs:refresh";
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class GitDiffsPlugin extends Plugin {
+	settings!: GitDiffsSettings;
+	private pendingRefresh: Set<string> = new Set();
+	private refreshDebouncer: Debouncer<[], void> | null = null;
+	private inFlight: WeakMap<GitDiffsView, Promise<void>> = new WeakMap();
+	private refreshCounter = 0;
 
-	async onload() {
+	async onload(): Promise<void> {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		this.registerView(GIT_DIFFS_VIEW_TYPE, (leaf) => new GitDiffsView(leaf, this));
+
+		this.addRibbonIcon("git-compare", "Show git diff for active file", () => {
+			void this.showDiffForActiveFile();
 		});
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
+			id: "show-diff-active-file",
+			name: "Show diff for active file",
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) void this.showDiffForActiveFile();
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "show-diff-vault",
+			name: "Show diff for entire vault",
 			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
+				void this.showDiffForVault();
+			},
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addSettingTab(new GitDiffsSettingTab(this.app, this));
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		this.rebuildAutoRefresh();
+		this.app.workspace.onLayoutReady(() => this.registerVaultEvents());
 	}
 
-	onunload() {
+	onunload(): void {}
+
+	async loadSettings(): Promise<void> {
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			(await this.loadData()) as Partial<GitDiffsSettings>,
+		);
 	}
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
-	}
-
-	async saveSettings() {
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+
+	rebuildAutoRefresh(): void {
+		this.refreshDebouncer?.cancel();
+		this.refreshDebouncer = debounce(
+			() => this.emitRefresh(),
+			this.settings.autoRefreshDelay,
+			true,
+		);
+	}
+
+	refreshAllViews(): void {
+		const leaves = this.app.workspace.getLeavesOfType(GIT_DIFFS_VIEW_TYPE);
+		for (const leaf of leaves) {
+			const view = leaf.view as GitDiffsView;
+			void this.refreshDiff(view, view.getPersistedFilePath());
+		}
+	}
+
+	private registerVaultEvents(): void {
+		const handler = (file: TAbstractFile) => {
+			if (!this.settings.autoRefresh) return;
+			if (this.isIgnoredPath(file.path)) return;
+			this.pendingRefresh.add(file.path);
+			this.refreshDebouncer?.();
+		};
+
+		this.registerEvent(this.app.vault.on("modify", handler));
+		this.registerEvent(this.app.vault.on("create", handler));
+		this.registerEvent(this.app.vault.on("delete", handler));
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (!this.settings.autoRefresh) return;
+				if (this.isIgnoredPath(file.path) && this.isIgnoredPath(oldPath)) return;
+				this.pendingRefresh.add(file.path);
+				this.pendingRefresh.add(oldPath);
+				this.refreshDebouncer?.();
+			}),
+		);
+	}
+
+	private isIgnoredPath(path: string): boolean {
+		return this.settings.ignorePaths.some((prefix) => prefix && path.startsWith(prefix));
+	}
+
+	private emitRefresh(): void {
+		const paths = Array.from(this.pendingRefresh);
+		this.pendingRefresh.clear();
+		this.app.workspace.trigger(GIT_DIFFS_REFRESH_EVENT, paths);
+	}
+
+	private emptyState(title: string, message: string): DiffViewState {
+		return {
+			title,
+			message,
+			files: [],
+			cacheKey: `msg:${message}`,
+			diffStyle: this.settings.diffStyle,
+			overflow: this.settings.overflow,
+		};
+	}
+
+	async refreshDiff(view: GitDiffsView, filePath: string | null): Promise<void> {
+		const existing = this.inFlight.get(view);
+		if (existing) return existing;
+		const p = this.runRefresh(view, filePath).finally(() => {
+			this.inFlight.delete(view);
+		});
+		this.inFlight.set(view, p);
+		return p;
+	}
+
+	private async runRefresh(view: GitDiffsView, filePath: string | null): Promise<void> {
+		const id = ++this.refreshCounter;
+		const t0 = performance.now();
+
+		const cwd = this.getVaultPath();
+		if (!cwd) {
+			view.setDiff(this.emptyState("Git Diffs — error", "Could not resolve vault path"), filePath);
+			return;
+		}
+		if (!(await isGitRepo(cwd))) {
+			view.setDiff(this.emptyState("Git Diffs — error", "Vault is not a git repository"), filePath);
+			return;
+		}
+
+		const title = filePath ? `Diff: ${filePath}` : "Diff: vault";
+
+		try {
+			const { patch } = await getGitDiff({
+				cwd,
+				baseRef: this.settings.baseRef,
+				relativePath: filePath ?? undefined,
+				includeUntracked: this.settings.includeUntracked,
+			});
+
+			if (!patch.trim()) {
+				view.setDiff(this.emptyState(title, "No changes."), filePath);
+				return;
+			}
+
+			const files = await this.enrichPatchFiles(cwd, patch);
+
+			if (files.length === 0) {
+				view.setDiff(this.emptyState(title, "No changes (all paths ignored)."), filePath);
+				return;
+			}
+
+			const key = hashString(patch);
+			if (view.getCacheKey() === key) {
+				console.log(`[git-diffs] #${id} cache hit — skipping setDiff`);
+				return;
+			}
+
+			view.setDiff(
+				{
+					title,
+					message: null,
+					files,
+					cacheKey: key,
+					diffStyle: view.getDiffStyle(),
+					overflow: view.getOverflow(),
+				},
+				filePath,
+			);
+			console.log(
+				`[git-diffs] #${id} ${files.length} files, ${(performance.now() - t0).toFixed(0)}ms`,
+			);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			new Notice(`git diff failed: ${message}`);
+			view.setDiff(this.emptyState("Git Diffs — error", message), filePath);
+			console.error(`[git-diffs] #${id} failed`, err);
+		}
+	}
+
+	private async enrichPatchFiles(cwd: string, patch: string): Promise<FileRenderSpec[]> {
+		const patches = parsePatchFiles(patch, undefined, false);
+		const fileMetas = patches
+			.flatMap((p) => p.files)
+			.filter((m) => !this.isIgnoredPath(m.name) && !this.isIgnoredPath(m.prevName ?? m.name));
+
+		const threshold = this.settings.largeFileThresholdBytes;
+
+		const specs = await Promise.all(
+			fileMetas.map(async (meta): Promise<FileRenderSpec> => {
+				const isNew = meta.type === "new";
+				const isDeleted = meta.type === "deleted";
+				const oldPath = meta.prevName ?? meta.name;
+
+				// Probe sizes without reading contents for large-file detection.
+				const [oldSize, newSize] = await Promise.all([
+					isNew ? 0 : this.probeBlobSize(cwd, this.settings.baseRef, oldPath),
+					isDeleted ? 0 : this.probeWorkingSize(meta.name),
+				]);
+
+				if (oldSize > threshold || newSize > threshold) {
+					return { name: meta.name, largeFile: { oldSize, newSize } };
+				}
+
+				const [oldContents, newContents] = await Promise.all([
+					isNew ? "" : ((await readGitBlob(cwd, this.settings.baseRef, oldPath)) ?? ""),
+					isDeleted ? "" : ((await this.readWorkingFile(meta.name)) ?? ""),
+				]);
+
+				return {
+					name: meta.name,
+					oldFile: { name: oldPath, contents: oldContents },
+					newFile: { name: meta.name, contents: newContents },
+				};
+			}),
+		);
+		return specs;
+	}
+
+	async loadLargeFile(spec: FileRenderSpec): Promise<{ oldFile?: FileContents; newFile?: FileContents }> {
+		const cwd = this.getVaultPath();
+		if (!cwd) throw new Error("Could not resolve vault path");
+		const oldPath = spec.name; // TODO: preserve prevName for renames on large files
+		const [oldContents, newContents] = await Promise.all([
+			readGitBlob(cwd, this.settings.baseRef, oldPath),
+			this.readWorkingFile(spec.name),
+		]);
+		return {
+			oldFile: { name: oldPath, contents: oldContents ?? "" },
+			newFile: { name: spec.name, contents: newContents ?? "" },
+		};
+	}
+
+	private async probeBlobSize(cwd: string, ref: string, path: string): Promise<number> {
+		const content = await readGitBlob(cwd, ref, path);
+		return content?.length ?? 0;
+	}
+
+	private async probeWorkingSize(relativePath: string): Promise<number> {
+		try {
+			const stat = await this.app.vault.adapter.stat(relativePath);
+			return stat?.size ?? 0;
+		} catch {
+			return 0;
+		}
+	}
+
+	private async readWorkingFile(relativePath: string): Promise<string | null> {
+		try {
+			return await this.app.vault.adapter.read(relativePath);
+		} catch {
+			return null;
+		}
+	}
+
+	private getVaultPath(): string | null {
+		const adapter = this.app.vault.adapter as { basePath?: string; getBasePath?: () => string };
+		if (typeof adapter.getBasePath === "function") return adapter.getBasePath();
+		if (typeof adapter.basePath === "string") return adapter.basePath;
+		return null;
+	}
+
+	private async ensureView(): Promise<GitDiffsView> {
+		const existing = this.app.workspace.getLeavesOfType(GIT_DIFFS_VIEW_TYPE)[0];
+		let leaf: WorkspaceLeaf;
+		if (existing) {
+			leaf = existing;
+		} else {
+			leaf = this.app.workspace.getLeaf("tab");
+			await leaf.setViewState({ type: GIT_DIFFS_VIEW_TYPE, active: true });
+		}
+		this.app.workspace.revealLeaf(leaf);
+		return leaf.view as GitDiffsView;
+	}
+
+	private async showDiffForActiveFile(): Promise<void> {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const file = view?.file;
+		if (!file) {
+			new Notice("No active file");
+			return;
+		}
+		const target = await this.ensureView();
+		target.setDiff(this.emptyState(`Diff: ${file.path}`, "Loading…"), file.path);
+		await this.refreshDiff(target, file.path);
+	}
+
+	private async showDiffForVault(): Promise<void> {
+		const target = await this.ensureView();
+		target.setDiff(this.emptyState("Diff: vault", "Loading…"), null);
+		await this.refreshDiff(target, null);
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+function hashString(s: string): string {
+	let h = 0;
+	for (let i = 0; i < s.length; i++) {
+		h = (h * 31 + s.charCodeAt(i)) | 0;
 	}
-
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
+	return `${h.toString(16)}:${s.length}`;
 }

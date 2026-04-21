@@ -1,6 +1,16 @@
 import esbuild from "esbuild";
 import process from "process";
+import path from "node:path";
 import { builtinModules } from 'node:module';
+
+const pierreDeepPath = {
+	name: "pierre-deep-path",
+	setup(build) {
+		build.onResolve({ filter: /^@pierre\/diffs\/dist\// }, (args) => ({
+			path: path.resolve(process.cwd(), "node_modules", args.path),
+		}));
+	},
+};
 
 const banner =
 `/*
@@ -36,9 +46,10 @@ const context = await esbuild.context({
 	target: "es2018",
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
-	treeShaking: true,
+	treeShaking: false,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [pierreDeepPath],
 });
 
 if (prod) {

@@ -1,8 +1,137 @@
-/*
+.workspace-leaf-content[data-type="git-diffs-view"] .view-content {
+	padding: 0;
+	overflow: hidden;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.git-diffs-view {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	gap: 0.5rem;
+}
 
-If your plugin does not need CSS, delete this file.
+.git-diffs-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: auto;
+	padding: 0.75rem 1rem 1rem;
+}
 
-*/
+.git-diffs-content {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+
+.git-diffs-body diffs-container {
+	display: block;
+	flex: 0 0 auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	overflow: hidden;
+
+	/* Follow Obsidian's theme, not the OS. `color-scheme` drives Pierre's
+	   light-dark() selection inside the shadow DOM. */
+	color-scheme: light;
+
+	/* Base background — Pierre derives --diffs-bg from these via light-dark(). */
+	--diffs-dark-bg: var(--background-secondary);
+	--diffs-light-bg: var(--background-secondary);
+
+	/* Fonts & layout (from Pierre docs) */
+	--diffs-font-family: var(--font-monospace);
+	--diffs-font-size: var(--font-ui-smaller);
+	--diffs-line-height: 1.5;
+	--diffs-tab-size: 4;
+	--diffs-header-font-family: var(--font-interface);
+	--diffs-min-number-column-width: 3ch;
+	--diffs-gap-inline: 8px;
+	--diffs-gap-block: 8px;
+
+	/* Surface overrides */
+	--diffs-bg-context-override: var(--background-secondary);
+	--diffs-bg-buffer-override: var(--background-secondary);
+	--diffs-bg-separator-override: var(--background-modifier-border);
+	--diffs-bg-hover-override: var(--background-modifier-hover);
+
+	--diffs-fg-number-override: var(--text-muted);
+	--diffs-fg-number-addition-override: var(--text-normal);
+	--diffs-fg-number-deletion-override: var(--text-normal);
+
+	--diffs-addition-color-override: var(--color-green);
+	--diffs-deletion-color-override: var(--color-red);
+	--diffs-modified-color-override: var(--color-blue);
+
+	--diffs-bg-addition-override: color-mix(in srgb, var(--color-green) 12%, transparent);
+	--diffs-bg-addition-number-override: color-mix(in srgb, var(--color-green) 20%, transparent);
+	--diffs-bg-addition-emphasis-override: color-mix(in srgb, var(--color-green) 28%, transparent);
+	--diffs-bg-addition-hover-override: color-mix(in srgb, var(--color-green) 22%, transparent);
+
+	--diffs-bg-deletion-override: color-mix(in srgb, var(--color-red) 12%, transparent);
+	--diffs-bg-deletion-number-override: color-mix(in srgb, var(--color-red) 20%, transparent);
+	--diffs-bg-deletion-emphasis-override: color-mix(in srgb, var(--color-red) 28%, transparent);
+	--diffs-bg-deletion-hover-override: color-mix(in srgb, var(--color-red) 22%, transparent);
+}
+
+body.theme-dark .git-diffs-body diffs-container {
+	color-scheme: dark;
+}
+
+.git-diffs-empty {
+	color: var(--text-muted);
+	font-style: italic;
+}
+
+.git-diffs-placeholder {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	padding: 1rem;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+}
+
+.git-diffs-placeholder-name {
+	font-family: var(--font-monospace);
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.git-diffs-placeholder-msg {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.git-diffs-placeholder-btn {
+	align-self: flex-start;
+	padding: 0.25rem 0.75rem;
+	background: var(--interactive-normal);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	color: var(--text-normal);
+	cursor: pointer;
+}
+
+.git-diffs-placeholder-btn:hover {
+	background: var(--interactive-hover);
+}
+
+.git-diffs-placeholder-btn:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.git-diffs-placeholder-err {
+	color: var(--color-red);
+	font-size: var(--font-ui-smaller);
+	white-space: pre-wrap;
+}
+
+.git-diffs-body diffs-container {
+	/* Make the filename inside Pierre's header behave like a link on hover.
+	   Actual cursor/click is wired up via onPostRender in render.ts, but we
+	   style hover here to give it affordance. */
+	--diffs-header-filename-hover: var(--text-accent);
+}
+
