@@ -4,6 +4,7 @@ import {
 	Notice,
 	Plugin,
 	TAbstractFile,
+	TFile,
 	WorkspaceLeaf,
 	debounce,
 } from "obsidian";
@@ -11,7 +12,8 @@ import { type FileContents, parsePatchFiles } from "@pierre/diffs";
 import { DEFAULT_SETTINGS, GitDiffsSettings, GitDiffsSettingTab } from "./settings";
 import { DiffViewState, GIT_DIFFS_VIEW_TYPE, GitDiffsView } from "./view";
 import { FileRenderSpec } from "./render";
-import { getGitDiff, isGitRepo, readGitBlob } from "./git";
+import { FileExplorerDecorator } from "./explorer";
+import { getGitDiff, getGitStatus, isGitRepo, readGitBlob, type StatusCode } from "./git";
 
 export const GIT_DIFFS_REFRESH_EVENT = "git-diffs:refresh";
 
@@ -21,6 +23,9 @@ export default class GitDiffsPlugin extends Plugin {
 	private refreshDebouncer: Debouncer<[], void> | null = null;
 	private inFlight: WeakMap<GitDiffsView, Promise<void>> = new WeakMap();
 	private refreshCounter = 0;
+	private explorerDecorator: FileExplorerDecorator | null = null;
+	private statusMap: Map<string, StatusCode> = new Map();
+	private statusBarEl: HTMLElement | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -52,11 +57,37 @@ export default class GitDiffsPlugin extends Plugin {
 
 		this.addSettingTab(new GitDiffsSettingTab(this.app, this));
 
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (!(file instanceof TFile)) return;
+				menu.addItem((item) =>
+					item
+						.setTitle("Show git diff")
+						.setIcon("git-compare")
+						.onClick(() => void this.showDiffForFile(file)),
+				);
+			}),
+		);
+
+		this.statusBarEl = this.addStatusBarItem();
+		this.statusBarEl.addClass("git-diffs-status-bar");
+		this.statusBarEl.addEventListener("click", () => void this.showDiffForVault());
+		this.updateStatusBar();
+
 		this.rebuildAutoRefresh();
-		this.app.workspace.onLayoutReady(() => this.registerVaultEvents());
+		this.app.workspace.onLayoutReady(() => {
+			this.registerVaultEvents();
+			this.explorerDecorator = new FileExplorerDecorator(this.app);
+			void this.refreshStatus();
+			this.registerEvent(
+				this.app.workspace.on("layout-change", () => this.explorerDecorator?.apply()),
+			);
+		});
 	}
 
-	onunload(): void {}
+	onunload(): void {
+		this.explorerDecorator?.clear();
+	}
 
 	async loadSettings(): Promise<void> {
 		this.settings = Object.assign(
@@ -117,6 +148,54 @@ export default class GitDiffsPlugin extends Plugin {
 		const paths = Array.from(this.pendingRefresh);
 		this.pendingRefresh.clear();
 		this.app.workspace.trigger(GIT_DIFFS_REFRESH_EVENT, paths);
+		void this.refreshStatus();
+	}
+
+	async refreshStatus(): Promise<void> {
+		if (!this.explorerDecorator) return;
+		const cwd = this.getVaultPath();
+		if (!cwd || !(await isGitRepo(cwd))) {
+			this.statusMap.clear();
+			this.explorerDecorator.clear();
+			return;
+		}
+		const filtered = new Map<string, StatusCode>();
+		const full = await getGitStatus(cwd);
+		for (const [path, code] of full) {
+			if (this.isIgnoredPath(path)) continue;
+			filtered.set(path, code);
+		}
+		this.statusMap = filtered;
+		this.explorerDecorator.setStatus(filtered);
+		this.updateStatusBar();
+	}
+
+	private updateStatusBar(): void {
+		if (!this.statusBarEl) return;
+		this.statusBarEl.empty();
+
+		if (this.statusMap.size === 0) {
+			this.statusBarEl.setAttribute("aria-label", "No uncommitted changes");
+			this.statusBarEl.createSpan({ text: "✓", cls: "git-diffs-status-bar-clean" });
+			return;
+		}
+
+		const counts: Record<StatusCode, number> = { M: 0, A: 0, D: 0, R: 0, U: 0, I: 0 };
+		for (const code of this.statusMap.values()) counts[code]++;
+
+		this.statusBarEl.setAttribute(
+			"aria-label",
+			`${this.statusMap.size} changed file(s) — click to show vault diff`,
+		);
+
+		const order: StatusCode[] = ["M", "A", "D", "R", "U"];
+		for (const code of order) {
+			if (counts[code] === 0) continue;
+			this.statusBarEl.createSpan({
+				text: `${code}${counts[code]}`,
+				cls: `git-diffs-status-bar-item git-diffs-status-bar-${code}`,
+			});
+		}
 	}
 
 	private emptyState(title: string, message: string): DiffViewState {
@@ -190,6 +269,7 @@ export default class GitDiffsPlugin extends Plugin {
 					cacheKey: key,
 					diffStyle: view.getDiffStyle(),
 					overflow: view.getOverflow(),
+					stats: this.lastStats,
 				},
 				filePath,
 			);
@@ -204,11 +284,23 @@ export default class GitDiffsPlugin extends Plugin {
 		}
 	}
 
+	lastStats: { additions: number; deletions: number } = { additions: 0, deletions: 0 };
+
 	private async enrichPatchFiles(cwd: string, patch: string): Promise<FileRenderSpec[]> {
 		const patches = parsePatchFiles(patch, undefined, false);
 		const fileMetas = patches
 			.flatMap((p) => p.files)
 			.filter((m) => !this.isIgnoredPath(m.name) && !this.isIgnoredPath(m.prevName ?? m.name));
+
+		let additions = 0;
+		let deletions = 0;
+		for (const meta of fileMetas) {
+			for (const hunk of meta.hunks ?? []) {
+				additions += hunk.additionLines ?? 0;
+				deletions += hunk.deletionLines ?? 0;
+			}
+		}
+		this.lastStats = { additions, deletions };
 
 		const threshold = this.settings.largeFileThresholdBytes;
 
@@ -306,6 +398,10 @@ export default class GitDiffsPlugin extends Plugin {
 			new Notice("No active file");
 			return;
 		}
+		await this.showDiffForFile(file);
+	}
+
+	async showDiffForFile(file: TFile): Promise<void> {
 		const target = await this.ensureView();
 		target.setDiff(this.emptyState(`Diff: ${file.path}`, "Loading…"), file.path);
 		await this.refreshDiff(target, file.path);
@@ -325,3 +421,4 @@ function hashString(s: string): string {
 	}
 	return `${h.toString(16)}:${s.length}`;
 }
+

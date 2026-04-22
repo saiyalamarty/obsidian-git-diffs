@@ -76,6 +76,54 @@ export async function isGitRepo(cwd: string): Promise<boolean> {
 	}
 }
 
+export type StatusCode = "M" | "A" | "D" | "R" | "U" | "I";
+
+const STATUS_BY_CHAR: Record<string, StatusCode | undefined> = {
+	M: "M",
+	A: "A",
+	D: "D",
+	R: "R",
+	C: "R",
+	T: "M",
+};
+
+function classifyStatus(x: string, y: string): StatusCode {
+	if (x === "?" && y === "?") return "U";
+	if (x === "!" && y === "!") return "I";
+	if (x === "R" || y === "R" || x === "C" || y === "C") return "R";
+	return STATUS_BY_CHAR[y] ?? STATUS_BY_CHAR[x] ?? "M";
+}
+
+export async function getGitStatus(cwd: string): Promise<Map<string, StatusCode>> {
+	const result = new Map<string, StatusCode>();
+	try {
+		const { stdout } = await execAsync(
+			"git status --porcelain=v1 -z --untracked-files=all",
+			{ cwd, maxBuffer: 20 * 1024 * 1024 },
+		);
+		const tokens = stdout.split("\0");
+		let i = 0;
+		while (i < tokens.length) {
+			const tok = tokens[i];
+			if (!tok || tok.length < 3) {
+				i++;
+				continue;
+			}
+			const x = tok.charAt(0);
+			const y = tok.charAt(1);
+			const path = tok.slice(3);
+			const code = classifyStatus(x, y);
+			result.set(path, code);
+			// Rename/copy entries are followed by the origPath as the next token.
+			if (x === "R" || x === "C" || y === "R" || y === "C") i++;
+			i++;
+		}
+	} catch (err) {
+		console.error("[git-diffs] git status failed", err);
+	}
+	return result;
+}
+
 export async function readGitBlob(cwd: string, ref: string, path: string): Promise<string | null> {
 	try {
 		const { stdout } = await execAsync(

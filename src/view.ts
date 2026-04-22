@@ -4,6 +4,11 @@ import { DiffRenderHandle, DiffStyle, FileRenderSpec, Overflow, renderDiff } fro
 
 export const GIT_DIFFS_VIEW_TYPE = "git-diffs-view";
 
+export interface DiffStats {
+	additions: number;
+	deletions: number;
+}
+
 export interface DiffViewState {
 	title: string;
 	message: string | null;
@@ -11,6 +16,7 @@ export interface DiffViewState {
 	cacheKey: string;
 	diffStyle: DiffStyle;
 	overflow: Overflow;
+	stats?: DiffStats;
 }
 
 interface PersistedState {
@@ -246,6 +252,22 @@ export class GitDiffsView extends ItemView {
 		this.redraw();
 	}
 
+	private renderSummary(body: HTMLElement): void {
+		const { stats, files } = this.currentState;
+		if (!stats || files.length === 0) return;
+		const fileWord = files.length === 1 ? "file" : "files";
+		const summary = body.createEl("div", { cls: "git-diffs-summary" });
+		summary.createSpan({ text: `${files.length} ${fileWord} changed` });
+		summary.createSpan({
+			text: `+${stats.additions}`,
+			cls: "git-diffs-summary-add",
+		});
+		summary.createSpan({
+			text: `−${stats.deletions}`,
+			cls: "git-diffs-summary-del",
+		});
+	}
+
 	private disposeActiveRender(): void {
 		if (this.activeRender) {
 			this.activeRender.cleanup();
@@ -270,6 +292,8 @@ export class GitDiffsView extends ItemView {
 			this.renderedCacheKey = this.currentState.cacheKey;
 			return;
 		}
+
+		this.renderSummary(body);
 
 		const content = body.createEl("div", { cls: "git-diffs-content" });
 		const key = this.currentState.cacheKey;
